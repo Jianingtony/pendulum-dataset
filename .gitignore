@@ -166,3 +166,13 @@ data/
 *.gif
 # Except if you want to track specific visualizations in the root, uncomment below or add them explicitly:
 !verification_pendulum.gif
+
+# Track specific run results (K7_fixed_b_vi_v3)
+!/runs/
+/runs/*
+!/runs/K7_fixed_b_vi_v3/
+!/runs/K7_fixed_b_vi_v3/**/*.gif
+!/runs/K7_fixed_b_vi_v3/**/*.png
+!/runs/K7_fixed_b_vi_v3/**/*.pkl
+!/runs/K7_fixed_b_vi_v3/**/*.npy
+!/runs/K7_fixed_b_vi_v3/**/*.json
