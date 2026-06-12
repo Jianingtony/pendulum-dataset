@@ -317,44 +317,87 @@ def _resample_transitions(p: ModelParams, cfg: Config,
 # Three-stage initialization
 # ---------------------------------------------------------------------------
 def initialize(model: RecurrentARHMM, trajs: Sequence[Trajectory],
-               rng: np.random.Generator) -> List[np.ndarray]:
+               rng: np.random.Generator, fixed_b: Optional[np.ndarray] = None) -> List[np.ndarray]:
     """Returns initial z_{1:T} for every trajectory.  Also fills model.params."""
     cfg = model.cfg
     K, M, P = cfg.K, cfg.obs_dim, cfg.ar_lag
     model.init_random(rng)
     p = model.params
 
-    # --- (a) k-means on (x_t, x_{t+1} - x_t) to seed states ---
+    # --- (a) state seeding (physical distance-based if fixed_b is provided, else k-means) ---
     X_in, X_out, traj_idx, t_idx = stack_for_ar(trajs, P=P)
-    feats = np.concatenate([X_out, X_out - X_in[:, :M]], axis=1)
-    km = KMeans(n_clusters=K, n_init=cfg.init_kmeans_n_init,
-                random_state=cfg.init_seed).fit(feats)
-    z_flat = km.labels_
+    if fixed_b is not None and K in (5, 7):
+        if K == 7:
+            # Reconstruct theta_mid and theta_high
+            # index 4 is +theta_mid, index 5 is +theta_high
+            ratio = fixed_b[4, 0] / fixed_b[5, 0] if fixed_b[5, 0] != 0.0 else 0.333
+            theta_mid = np.radians(20.0) if ratio < 0.28 else np.radians(30.0)
+            theta_high = np.radians(90.0)
+            anchors_monotonic = np.array([-theta_high, -theta_mid, 0.0, theta_mid, theta_high])
+            
+            theta_t = X_in[:, 0]
+            theta_next = X_out[:, 0]
+            diff_theta = theta_next - theta_t
+            
+            is_cw_wrap = diff_theta > 5.0
+            is_ccw_wrap = diff_theta < -5.0
+            
+            z_flat = np.zeros(len(X_out), dtype=np.int64)
+            for i in range(len(X_out)):
+                if is_cw_wrap[i]:
+                    z_flat[i] = 0
+                elif is_ccw_wrap[i]:
+                    z_flat[i] = 6
+                else:
+                    th = theta_t[i]
+                    idx = np.argmin(np.abs(th - anchors_monotonic))
+                    z_flat[i] = idx + 1
+        else: # K == 5
+            # original K=5 layout: 0.0, +mid, -mid, +high, -high
+            ratio = fixed_b[1, 0] / fixed_b[3, 0] if fixed_b[3, 0] != 0.0 else 0.333
+            theta_mid = np.radians(20.0) if ratio < 0.28 else np.radians(30.0)
+            theta_high = np.radians(90.0)
+            anchors = np.array([0.0, theta_mid, -theta_mid, theta_high, -theta_high])
+            theta_t = X_in[:, 0]
+            z_flat = np.zeros(len(X_out), dtype=np.int64)
+            for i in range(len(X_out)):
+                z_flat[i] = np.argmin(np.abs(theta_t[i] - anchors))
+    else:
+        feats = np.concatenate([X_out, X_out - X_in[:, :M]], axis=1)
+        km = KMeans(n_clusters=K, n_init=cfg.init_kmeans_n_init,
+                    random_state=cfg.init_seed).fit(feats)
+        z_flat = km.labels_
 
     # --- (b) AR-HMM EM: fit AR params per cluster, then iterate hard-EM ---
-    for _ in range(cfg.init_arhmm_em_iter):
+    init_em_iter = cfg.init_arhmm_em_iter
+    for em_iter in range(init_em_iter):
         # M-step: AR params
         for k in range(K):
             idx = (z_flat == k)
             if idx.sum() < M + 2:
                 continue
             Xk, Yk = X_in[idx], X_out[idx]
-            # ridge regression
-            Reg = 1e-4 * np.eye(Xk.shape[1])
-            B = np.linalg.solve(Xk.T @ Xk + Reg, Xk.T @ Yk).T               # (M, D_in_ar)
+            if fixed_b is not None:
+                b_k = fixed_b[k]
+                Xk_no_bias = Xk[:, :-1]
+                Yk_no_bias = Yk - b_k[None, :]
+                Reg = 1e-4 * np.eye(Xk_no_bias.shape[1])
+                A_dyn = np.linalg.solve(Xk_no_bias.T @ Xk_no_bias + Reg, Xk_no_bias.T @ Yk_no_bias).T
+                B = np.concatenate([A_dyn, b_k[:, None]], axis=1)
+            else:
+                # ridge regression
+                Reg = 1e-4 * np.eye(Xk.shape[1])
+                B = np.linalg.solve(Xk.T @ Xk + Reg, Xk.T @ Yk).T               # (M, D_in_ar)
             p.A[k] = B
             resid = Yk - Xk @ B.T
             p.Q[k] = resid.T @ resid / max(idx.sum() - 1, 1) + 1e-4 * np.eye(M)
+            
         # E-step (hard): re-assign z_t to argmax_k log N(x_t | A_k X_in_t, Q_k)
         log_ar = p.log_ar_likelihood(X_in, X_out)                           # (N, K)
         z_flat = log_ar.argmax(axis=1)
 
     # --- (c) decision-list initialization for the recurrence (paper §4.4) ---
     if cfg.init_decision_list and K > 1:
-        # Greedy: for each stick j = 0..K-2, find the binary split
-        # (state j vs states > j) that's most separable in x_t, fit logistic regression.
-        # We use x_{t} -> "is z_{t+1} == permuted_state[j]" classifier.
-        order = list(range(K))
         # build dataset of x_{t} -> z_{t+1}
         Xrec, Znext = [], []
         for i, tr in enumerate(trajs):
@@ -366,7 +409,10 @@ def initialize(model: RecurrentARHMM, trajs: Sequence[Trajectory],
             Znext.append(zi)                                    # zi[s] is z at data-time s+P
         Xrec = np.concatenate(Xrec, 0)
         Znext = np.concatenate(Znext, 0)
-        # greedy permutation
+        
+        # Greedy: for each stick j = 0..K-2, find the binary split
+        # (state j vs states > j) that's most separable in x_t, fit logistic regression.
+        order = list(range(K))
         remaining = set(order)
         perm = []
         for j in range(K - 1):
@@ -393,20 +439,19 @@ def initialize(model: RecurrentARHMM, trajs: Sequence[Trajectory],
             remaining.discard(best_k)
             if best_coef is not None and p.mode in ("shared", "ro"):
                 p.R[:, j, :M] = best_coef
-                if p.mode == "ro":
-                    p.r[:, j] = best_intc
-                else:
-                    p.r[:, j] = best_intc
+                p.r[:, j] = best_intc
             elif best_coef is not None:
                 for kp in range(K):
                     p.R[kp, j, :M] = best_coef
                     p.r[kp, j] = best_intc
         perm.append(next(iter(remaining)))
-        # apply permutation to z_flat and to A, Q
+        # apply permutation to z_flat and to A, Q, and fixed_b
         inv_perm = np.argsort(perm)
         z_flat = inv_perm[z_flat]
         p.A = p.A[perm]
         p.Q = p.Q[perm]
+        if fixed_b is not None:
+            fixed_b[:] = fixed_b[perm]
 
     # --- distribute z_flat back into per-trajectory arrays ---
     z_per: List[np.ndarray] = []

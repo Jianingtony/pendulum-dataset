@@ -387,11 +387,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--splits", type=str, default="all",
                    help="Comma-separated subset of "
                         "{train,val,test_in_dist,test_energy_oos} or 'all'.")
+    p.add_argument("--L", type=float, default=1.0,
+                   help="Pendulum rod length L (default: 1.0).")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    global L, W0, W0_SQ
+    L = args.L
+    W0 = math.sqrt(G / L)
+    W0_SQ = G / L
+
     out_root = Path(args.out).resolve() / "pendulum"
     out_root.mkdir(parents=True, exist_ok=True)
 

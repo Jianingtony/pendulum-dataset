@@ -165,4 +165,4 @@ data/
 *.png
 *.gif
 # Except if you want to track specific visualizations in the root, uncomment below or add them explicitly:
-# !verification_pendulum.gif
+!verification_pendulum.gif

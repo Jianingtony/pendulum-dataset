@@ -23,6 +23,7 @@ from rarhmm.train import load_checkpoint
 from rarhmm.config import Config
 from rarhmm.data import load_split
 from rarhmm.stick_breaking import stick_breaking_probs
+from rarhmm.inference import _per_traj_logobs_logtrans, ffbs_single
 
 PAPER_COLORS = [
     (0.214, 0.467, 0.659),   # windows blue
@@ -115,9 +116,29 @@ def main():
     all_err = []       # one-step prediction error per data point
     all_z = []         # state assignment per data point
 
+    # Create a shell model params with mean parameters
+    p_last = samples[-1]
+    p_last.A = A
+    p_last.Q = Q
+    p_last.R = R
+    p_last.r = r
+    log_init = ckpt.get("log_init", np.full(K, -np.log(K)))
+    rng = np.random.default_rng(42)
+
     for i, tr in enumerate(trajs):
-        z_i = z_last[i]  # state assignments for trajectory i
         T_i = tr.x.shape[0]
+        if T_i <= cfg.ar_lag:
+            continue
+        # Infer z dynamically using FFBS
+        bundle = _per_traj_logobs_logtrans(tr, p_last, cfg)
+        if bundle is None:
+            continue
+        log_obs, log_trans, _ = bundle
+        z_hmm = ffbs_single(log_init, log_trans, log_obs, rng)
+        z_i = np.empty(T_i, dtype=np.int64)
+        z_i[:cfg.ar_lag - 1] = z_hmm[0]
+        z_i[cfg.ar_lag - 1:] = z_hmm
+
         for t in range(T_i - 1):
             zt = z_i[t]
             x_t = tr.x[t]

@@ -92,43 +92,94 @@ def _m_step_dynamics(trajs: Sequence[Trajectory],
                      gammas: List[np.ndarray],
                      cfg: Config,
                      params: ModelParams,
-                     reg: float = 1e-4) -> None:
+                     reg: float = 1e-4,
+                     fixed_b: Optional[np.ndarray] = None) -> None:
     """Update A_k, Q_k with soft assignments (weighted regression)."""
     K, M, P = cfg.K, cfg.obs_dim, cfg.ar_lag
     D = M * P + 1
 
     for k in range(K):
-        XtX = np.zeros((D, D))
-        XtY = np.zeros((D, M))
-        YtY = np.zeros((M, M))
         w_total = 0.0
+        if fixed_b is not None:
+            # Fixed bias WLS update
+            D_in = M * P
+            XtX = np.zeros((D_in, D_in))
+            XtY = np.zeros((D_in, M))
+            b_fixed = fixed_b[k]  # (M,)
+            
+            for i, tr in enumerate(trajs):
+                T = tr.x.shape[0]
+                if T <= P:
+                    continue
+                gamma = gammas[i]
+                w = gamma[1:, k]
+                S = w.shape[0]
+                
+                lagged = np.concatenate(
+                    [tr.x[P - j - 1 : T - j - 1] for j in range(P)], axis=1)
+                X_out = tr.x[P:]
+                
+                # Regress on Y_prime = X_out - b_fixed
+                Y_prime = X_out - b_fixed[None, :]
+                wX = lagged * w[:, None]
+                XtX += wX.T @ lagged
+                XtY += wX.T @ Y_prime
+                w_total += w.sum()
+                
+            if w_total < D_in + 2:
+                continue
+                
+            XtX += reg * np.eye(D_in)
+            A_new_bar = np.linalg.solve(XtX, XtY).T  # (M, D_in)
+            A_new = np.concatenate([A_new_bar, b_fixed[:, None]], axis=1)  # (M, D)
+            
+        else:
+            # Unconstrained WLS update (original logic)
+            XtX = np.zeros((D, D))
+            XtY = np.zeros((D, M))
+            for i, tr in enumerate(trajs):
+                T = tr.x.shape[0]
+                if T <= P:
+                    continue
+                gamma = gammas[i]
+                w = gamma[1:, k]
+                S = w.shape[0]
+                
+                lagged = np.concatenate(
+                    [tr.x[P - j - 1 : T - j - 1] for j in range(P)], axis=1)
+                X_in = np.concatenate([lagged, np.ones((S, 1))], axis=1)
+                X_out = tr.x[P:]
+                
+                wX = X_in * w[:, None]
+                XtX += wX.T @ X_in
+                XtY += wX.T @ X_out
+                w_total += w.sum()
+                
+            if w_total < D + 2:
+                continue
+                
+            XtX += reg * np.eye(D)
+            A_new = np.linalg.solve(XtX, XtY).T  # (M, D)
 
+        # Standard residual-based covariance estimate Q_k
+        YtY_residual = np.zeros((M, M))
         for i, tr in enumerate(trajs):
             T = tr.x.shape[0]
             if T <= P:
                 continue
-            gamma = gammas[i]  # (S, K) where S = T-P+1
-            # gamma row 0 is the dummy "seed" row; AR data starts at row 1
-            w = gamma[1:, k]   # (T-P,)
+            gamma = gammas[i]
+            w = gamma[1:, k]
             S = w.shape[0]
-
+            
             lagged = np.concatenate(
                 [tr.x[P - j - 1 : T - j - 1] for j in range(P)], axis=1)
             X_in = np.concatenate([lagged, np.ones((S, 1))], axis=1)
             X_out = tr.x[P:]
-
-            wX = X_in * w[:, None]
-            XtX += wX.T @ X_in
-            XtY += wX.T @ X_out
-            YtY += (X_out * w[:, None]).T @ X_out
-            w_total += w.sum()
-
-        if w_total < D + 2:
-            continue
-
-        XtX += reg * np.eye(D)
-        A_new = np.linalg.solve(XtX, XtY).T                     # (M, D)
-        Q_new = (YtY - A_new @ XtY) / max(w_total, 1.0)         # (M, M)
+            
+            err = X_out - X_in @ A_new.T
+            YtY_residual += (err * w[:, None]).T @ err
+            
+        Q_new = YtY_residual / max(w_total, 1.0)
         Q_new = 0.5 * (Q_new + Q_new.T) + cfg.Q_jitter * np.eye(M)
 
         eigvals = np.linalg.eigvalsh(Q_new)
@@ -241,14 +292,14 @@ def _m_step_transitions_gd(trajs: Sequence[Trajectory],
 # ─────────────────────────────────────────────────────────────────────────────
 # Main EM loop
 # ─────────────────────────────────────────────────────────────────────────────
-
 def fit_vi(cfg: Config,
            trajs: Sequence[Trajectory],
            n_em_iter: int = 100,
            n_r_steps: int = 100,
            r_lr: float = 0.01,
            verbose: bool = True,
-           warm_start_path: Optional[str] = None) -> Dict[str, Any]:
+           warm_start_path: Optional[str] = None,
+           fixed_b: Optional[np.ndarray] = None) -> Dict[str, Any]:
     """Train rAR-HMM via Expectation-Maximisation.
 
     Parameters
@@ -259,6 +310,7 @@ def fit_vi(cfg: Config,
     n_r_steps     : gradient-descent steps per M-step for R.
     r_lr          : Adam learning rate for R.
     warm_start_path : optional path to a Gibbs chain.pkl to warm-start from.
+    fixed_b       : optional fixed bias matrix (K, M).
 
     Returns
     -------
@@ -285,13 +337,16 @@ def fit_vi(cfg: Config,
         if verbose:
             print(f"[vi] warm-started from {warm_start_path}")
     else:
-        z_state = initialize(model, trajs, rng)
+        z_state = initialize(model, trajs, rng, fixed_b=fixed_b)
+        if fixed_b is not None:
+            model.params.A[:, :, -1] = fixed_b
         if verbose:
-            print(f"[vi] initialised via k-means + AR-EM")
+            print(f"[vi] initialised via k-means + AR-EM (fixed_b projection={fixed_b is not None})")
 
     p = model.params
     log_init = np.full(K, -np.log(K))
     elbo_history: List[float] = []
+    samples_history = []
     t0 = time.time()
 
     for it in range(n_em_iter):
@@ -314,7 +369,7 @@ def fit_vi(cfg: Config,
             total_elbo += float(np.sum(gamma[1:] * log_obs[1:]))
 
         # ── M-step: dynamics A, Q ──
-        _m_step_dynamics(trajs, gammas, cfg, p)
+        _m_step_dynamics(trajs, gammas, cfg, p, fixed_b=fixed_b)
 
         # ── M-step: transitions R, r ──
         r_loss = _m_step_transitions_gd(
@@ -328,13 +383,13 @@ def fit_vi(cfg: Config,
         log_init = np.log(z0_counts + 1.0) - np.log(z0_counts.sum() + K)
 
         elbo_history.append(total_elbo)
+        samples_history.append(_copy_params(p))
         if verbose and (it % 5 == 0 or it == n_em_iter - 1):
             elapsed = time.time() - t0
             print(f"[vi] iter {it:4d}/{n_em_iter}  ELBO≈{total_elbo: .2f}  "
                   f"R_loss={r_loss:.4f}  elapsed={elapsed:.1f}s")
 
     # ── Build checkpoint (compatible with Gibbs format) ──
-    final_params = _copy_params(p)
     # hard z from gamma
     z_last = []
     for i, g in enumerate(gammas):
@@ -343,7 +398,7 @@ def fit_vi(cfg: Config,
 
     ckpt = {
         "cfg": cfg,
-        "samples": [final_params],          # single "sample" = EM point estimate
+        "samples": samples_history,          # List of parameter snapshots
         "z_last": z_last,
         "log_init": log_init,
         "loglik_history": np.asarray(elbo_history),
